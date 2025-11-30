@@ -1,208 +1,366 @@
-from mythic_payloadtype_container.PayloadBuilder import *
-from mythic_payloadtype_container.MythicCommandBase import *
-from mythic_payloadtype_container.MythicRPC import *
-import sys
-import json
 import asyncio
+import json
+import logging
 import os
-from distutils.dir_util import copy_tree
+import sys
 import tempfile
+import traceback
 import zipfile
-sys.path.insert(1, '/opt')
-import ShellcodeRDI
+from distutils.dir_util import copy_tree
 
-#define your payload type class here, it must extend the PayloadType class though
-class Nimpostor(PayloadType):
+from mythic_payloadtype_container.PayloadBuilder import *
+from mythic_payloadtype_container.MythicRPC import *
+from mythic_payloadtype_container.MythicCommandBase import *
 
-    name = "nimpostor"  # name that would show up in the UI
-    file_extension = "zip"  # default file extension to use when creating payloads
-    author = "@Sobol"  # author of the payload type
+# Attempt importing optional modules
+try:
+    sys.path.insert(1, "/opt")
+    import ShellcodeRDI
+except Exception:
+    ShellcodeRDI = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+class Nimble(PayloadType):
+
+    name = "nimble"
+    file_extension = "zip"
+    author = "@0xtb"
     mythic_encrypts = True
-    supported_os = [  # supported OS and architecture combos
-        SupportedOS.Windows, SupportedOS.Linux # update this list with all the OSes your agent supports
-    ]
-    wrapper = False  # does this payload type act as a wrapper for another payloads inside of it?
-    # if the payload supports any wrapper payloads, list those here
-    wrapped_payloads = [] # ex: "service_wrapper"
-    note = "A little agent written in Nim to infiltrate everything"
-    supports_dynamic_loading = True  # setting this to True allows users to only select a subset of commands when generating a payload
+    supported_os = [SupportedOS.Windows, SupportedOS.Linux]
+    wrapper = False
+    wrapped_payloads = []
+    note = "A Nim-based agent for Stage-1 C2 operations with httpx support."
+    supports_dynamic_loading = True
+
     build_parameters = [
-        #  these are all the build parameters that will be presented to the user when creating your payload
         BuildParameter(
             name="os",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Choose target OS",
+            description="Target operating system.",
             choices=["windows", "linux"],
-            default_value="windows",
-            ),
-        BuildParameter(
-            name="lang",
-            parameter_type=BuildParameterType.ChooseOne,
-            description="Choose the language the implant will be compiled in",
-            choices=["C", "C++"],
-            ),
-        BuildParameter(
-            name="build",
-            parameter_type=BuildParameterType.ChooseOne,
-            description="Choose if implant is built in debug mode or release mode. If in debug mode, source will be embedded in the comments and more output is shown",
-            default_value="release",
-            choices=["release", "debug"],
-            ),
+            default_value="windows"
+        ),
         BuildParameter(
             name="arch",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Target architecture",
+            description="Target architecture.",
             choices=["x64", "x86"],
-            default_value="x64",
-            ),
+            default_value="x64"
+        ),
         BuildParameter(
             name="format",
             parameter_type=BuildParameterType.ChooseOne,
-            description="Choose format for output",
+            description="Output format.",
             choices=["exe", "dll", "bin"],
-            ),
+            default_value="exe"
+        ),
+        BuildParameter(
+            name="build_type",
+            parameter_type=BuildParameterType.ChooseOne,
+            description="Debug or release build.",
+            choices=["release", "debug"],
+            default_value="release"
+        ),
         BuildParameter(
             name="chunk_size",
             parameter_type=BuildParameterType.String,
+            description="Message chunk size (bytes) for httpx.",
             default_value="512000",
-            description="Provide a chunk size for large files",
             required=False,
-            ),
+        ),
         BuildParameter(
             name="default_proxy",
             parameter_type=BuildParameterType.Boolean,
+            description="Use system default proxy.",
             default_value=False,
-            required=False,
-            description="Use the default proxy on the system",
-            ),
+            required=False
+        ),
     ]
-    #  the names of the c2 profiles that your agent supports
-    c2_profiles = ["http"]
+
+    c2_profiles = ["httpx", "http"]
+
     support_browser_scripts = [
-            BrowserScript(script_name="copy_additional_info_to_clipboard", author="@djhohnstein"),
-            BrowserScript(script_name="create_table", author="@djhohnstein"),
-            BrowserScript(script_name="create_table_with_name", author="@djhohnstein"),
-            BrowserScript(script_name="collapsable", author="@djhohnstein"),
-            BrowserScript(script_name="create_process_additional_info_modal", author="@djhohnstein"),
-            BrowserScript(script_name="file_size_to_human_readable_string", author="@djhohnstein"),
-            BrowserScript(script_name="integrity_level_to_string", author="@djhohnstein"),
-            BrowserScript(script_name="show_process_additional_info_modal", author="@djhohnstein"),
-            BrowserScript(script_name="show_permission_additional_info_modal", author="@djhohnstein"),
+        BrowserScript(script_name="copy_additional_info_to_clipboard", author="@djhohnstein"),
+        BrowserScript(script_name="create_table", author="@djhohnstein"),
+        BrowserScript(script_name="create_table_with_name", author="@djhohnstein"),
+        BrowserScript(script_name="collapsable", author="@djhohnstein"),
+        BrowserScript(script_name="create_process_additional_info_modal", author="@djhohnstein"),
+        BrowserScript(script_name="file_size_to_human_readable_string", author="@djhohnstein"),
+        BrowserScript(script_name="integrity_level_to_string", author="@djhohnstein"),
+        BrowserScript(script_name="show_process_additional_info_modal", author="@djhohnstein"),
+        BrowserScript(script_name="show_permission_additional_info_modal", author="@djhohnstein"),
     ]
-    #translation_container = None
-    # after your class has been instantiated by the mythic_service in this docker container and all required build parameters have values
-    # then this function is called to actually build the payload
-    async def build(self) -> BuildResponse:
-        # this function gets called to create an instance of your payload
-        resp = BuildResponse(status=BuildStatus.Error)
-        output = ""
-        special_files_map = {
-                "config.nim": {
-                    "CallBackHosts": "",
-                    "PayloadUUID": self.uuid,
-                    "UserAgent": "",
-                    "HostHeader": "",
-                    "Param": "",
-                    "ChunkSize": "",
-                    "DefaultProxy": "",
-                    "ProxyAddress": "",
-                    "ProxyUser": "",
-                    "ProxyPassword": "",
-                    "Sleep": "",
-                    "Jitter": "",
-                    "KillDate": "",
-                    "GetUrl": "",
-                    "PostUrl": "",
-                    "Psk": "",
-                },
+
+    # ------------------------------------------------------------------
+    # Construct compilation command
+    # ------------------------------------------------------------------
+    def _build_nim_command(self, build_path: str, aespsk_val: str, params: dict, profile_name: str) -> list:
+        arch_flag = "amd64" if params["arch"] == "x64" else "i386"
+
+        os_flags = []
+        if params["os"] == "linux":
+            os_flags = ["--os:linux", "--passL:-W", "--passL:-ldl"]
+
+        build_flags = (
+            ["-d:debug", "--hints:on", f"--nimcache:{build_path}"]
+            if params["build_type"] == "debug"
+            else ["-d:release", "--hints:off"]
+        )
+
+        format_flags = []
+        if params["format"] in ("dll", "bin"):
+            format_flags = ["--app:lib", "--nomain"]
+
+        # Define which C2 profile to compile
+        profile_flag = []
+        if profile_name == "httpx":
+            profile_flag = ["-d:HTTPX_PROFILE"]
+        elif profile_name == "http":
+            profile_flag = ["-d:HTTP_PROFILE"]
+
+        aes_flag = [f"-d:AESPSK={aespsk_val}"] if aespsk_val else []
+
+        out_ext = ".dll" if params["format"] in ("dll", "bin") else ".exe"
+
+        cmd = [
+            "nim",
+            "--threads:on",
+            "--gc:arc",
+            "--tlsEmulation:on",
+            "c",
+            "-f",
+            *os_flags,
+            *build_flags,
+            *profile_flag,
+            *aes_flag,
+            "--opt:size",
+            "--passC:-flto",
+            "--passL:-flto",
+            "--passL:-s",
+            *format_flags,
+            "--embedsrc:on" if params["build_type"] == "debug" else "",
+            f"--cpu:{arch_flag}",
+            f"--out:{self.name}{out_ext}",
+            "agent_code/c2/base.nim",
+        ]
+
+        # clean empty items
+        return [arg for arg in cmd if arg]
+
+    # ------------------------------------------------------------------
+    # Generate httpx configuration
+    # ------------------------------------------------------------------
+    def _generate_httpx_config(self, c2_params: dict) -> dict:
+        """
+        Extract httpx-specific configuration from Mythic C2 parameters.
+        """
+        config = {
+            "callback_host": c2_params.get("callback_host", ""),
+            "callback_port": c2_params.get("callback_port", 443),
+            "callback_interval": c2_params.get("callback_interval", 10),
+            "callback_jitter": c2_params.get("callback_jitter", 50),
+            "encrypted_exchange_check": c2_params.get("encrypted_exchange_check", True),
+            "domain_front": c2_params.get("domain_front", ""),
+            "get_uri": c2_params.get("get_uri", "/api/v1/status"),
+            "post_uri": c2_params.get("post_uri", "/api/v1/data"),
+            "query_path_name": c2_params.get("query_path_name", "q"),
+            "proxy_host": c2_params.get("proxy_host", ""),
+            "proxy_port": c2_params.get("proxy_port", ""),
+            "proxy_user": c2_params.get("proxy_user", ""),
+            "proxy_pass": c2_params.get("proxy_pass", ""),
+            "killdate": c2_params.get("killdate", ""),
+            "headers": {},
         }
 
+        # Process headers
+        if "headers" in c2_params:
+            if isinstance(c2_params["headers"], list):
+                for header in c2_params["headers"]:
+                    if "key" in header and "value" in header:
+                        config["headers"][header["key"]] = header["value"]
+            elif isinstance(c2_params["headers"], dict):
+                config["headers"] = c2_params["headers"]
+
+        return config
+
+    # ------------------------------------------------------------------
+    # Build process
+    # ------------------------------------------------------------------
+    async def build(self) -> BuildResponse:
+        resp = BuildResponse(status=BuildStatus.Error)
+        temp_dir = None
+
         try:
-            # make a temp directory for it to live
-            agent_build_path = tempfile.TemporaryDirectory(suffix=self.uuid)
-            # shutil to copy payload files over
-            copy_tree(self.agent_code_path, agent_build_path.name)
-            # first replace everything in the c2 profiles
-            file1 = open("{}/utils/config.nim".format(agent_build_path.name), 'r').read()
-            file1 = file1.replace('payload_uuid', self.uuid)
-            #file1 = file1.replace('%CHUNK_SIZE%', self.get_parameter('chunk_size'))
-            #file1 = file1.replace('%DEFAULT_PROXY%', "{}".format(self.get_parameter('default_proxy')))
-            profile = None
-            is_https = False
-            aespsk_val = ""
-            c2 = self.c2info[0]
-            profile = c2.get_c2profile()['name']
-            if profile not in self.c2_profiles:
-                resp.build_message = "Invalid c2 profile name specified"
+            # Setup workspace
+            temp_dir = tempfile.TemporaryDirectory(suffix=self.uuid)
+            build_root = temp_dir.name
+
+            copy_tree(self.agent_code_path, build_root)
+
+            if not self.c2info:
+                resp.build_message = "No C2 profile information provided."
                 return resp
-            for key, val in c2.get_parameters_dict().items():
-                if isinstance(val, dict):
-                    if c2.get_parameters_dict()["AESPSK"]["enc_key"] != None:
-                        aespsk_val = c2.get_parameters_dict()["AESPSK"]["enc_key"]
-                elif not isinstance(val, str):
-                    file1 = file1.replace(key, json.dumps(val))
-                else:
-                    file1 = file1.replace(key, val)
-            with open("{}/utils/config.nim".format(agent_build_path.name), 'w') as f:
-                f.write(file1)
 
-            out_ext = '.dll' if self.get_parameter('format') == 'bin' else '.dll' \
-                      if self.get_parameter('format') == 'dll' else '.exe'
+            c2 = self.c2info[0]
+            profile_name = c2.get_c2profile().get("name")
 
-            # TODO research --passL:-W --passL:ldl
-            resp.build_message += f'format: {self.get_parameter("format")}\n'
-            resp.build_message += f'aespsk_val: {aespsk_val}\n'
-            command = f"nim --threads:on --gc:arc --tlsEmulation:on {'c' if self.get_parameter('lang') == 'C' else 'cpp'} {'--os:linux --passL:-W --passL:-ldl' if self.get_parameter('os') == 'linux' else ''} -f -d:mingw {'-d:debug --hints:on --nimcache:' + agent_build_path.name if self.get_parameter('build') == 'debug' else '-d:release --hints:off'} {'-d:AESPSK=' + aespsk_val if len(aespsk_val) > 2 else ''} --opt:size --passC:-flto --passL:-flto --passL:-s {'--app:lib' if self.get_parameter('format') == 'dll' or self.get_parameter('format') == 'bin' else ''} {'--nomain' if self.get_parameter('format') == 'dll' or self.get_parameter('format') == 'bin' else ''} {'--embedsrc:on' if self.get_parameter('build') == 'debug' else ''} --cpu:{'amd64' if self.get_parameter('arch') == 'x64' else 'i386'} --out:{self.name}{out_ext} c2/base.nim"
-            resp.build_message += f'command: {command}\n attempting to compile...\n'
-            proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=agent_build_path.name)
+            if profile_name not in self.c2_profiles:
+                resp.build_message = f"Unsupported C2 profile '{profile_name}'. Supported: {', '.join(self.c2_profiles)}"
+                return resp
+
+            params = self.get_parameter_dict()
+
+            # Get C2 parameters
+            c2_params = c2.get_parameters_dict()
+            
+            # AES key
+            aespsk_val = ""
+            if isinstance(c2_params.get("AESPSK"), dict):
+                aespsk_val = c2_params["AESPSK"].get("enc_key", "")
+
+            # -------------------------
+            # Update configuration file
+            # -------------------------
+            config_path = os.path.join(build_root, "agent_code", "utils", "config.nim")
+
+            if not os.path.exists(config_path):
+                resp.build_message = "config.nim not found in agent_code/utils directory."
+                return resp
+
+            with open(config_path, "r") as cfg:
+                config_data = cfg.read()
+
+            # Prepare configuration replacements
+            replacements = {
+                "%CHUNK_SIZE%": params.get("chunk_size", "512000"),
+                "%DEFAULT_PROXY%": str(params.get("default_proxy", False)).lower(),
+                "%PAYLOAD_UUID%": self.uuid,
+                "%C2_PROFILE%": profile_name,
+            }
+
+            # Profile-specific configuration
+            if profile_name == "httpx":
+                httpx_config = self._generate_httpx_config(c2_params)
+                
+                replacements.update({
+                    "%CALLBACK_HOST%": httpx_config["callback_host"],
+                    "%CALLBACK_PORT%": str(httpx_config["callback_port"]),
+                    "%CALLBACK_INTERVAL%": str(httpx_config["callback_interval"]),
+                    "%CALLBACK_JITTER%": str(httpx_config["callback_jitter"]),
+                    "%GET_URI%": httpx_config["get_uri"],
+                    "%POST_URI%": httpx_config["post_uri"],
+                    "%QUERY_PATH_NAME%": httpx_config["query_path_name"],
+                    "%DOMAIN_FRONT%": httpx_config["domain_front"],
+                    "%PROXY_HOST%": httpx_config["proxy_host"],
+                    "%PROXY_PORT%": str(httpx_config["proxy_port"]) if httpx_config["proxy_port"] else "",
+                    "%PROXY_USER%": httpx_config["proxy_user"],
+                    "%PROXY_PASS%": httpx_config["proxy_pass"],
+                    "%KILLDATE%": httpx_config["killdate"],
+                    "%HEADERS%": json.dumps(httpx_config["headers"]),
+                    "%ENCRYPTED_EXCHANGE_CHECK%": str(httpx_config["encrypted_exchange_check"]).lower(),
+                })
+            
+            elif profile_name == "http":
+                # Standard HTTP profile configuration
+                replacements.update({
+                    "%CALLBACK_HOST%": c2_params.get("callback_host", ""),
+                    "%CALLBACK_PORT%": str(c2_params.get("callback_port", 443)),
+                    "%CALLBACK_INTERVAL%": str(c2_params.get("callback_interval", 10)),
+                    "%CALLBACK_JITTER%": str(c2_params.get("callback_jitter", 50)),
+                })
+
+            # Apply all replacements
+            for placeholder, value in replacements.items():
+                config_data = config_data.replace(placeholder, str(value))
+
+            # Handle any remaining C2 parameters
+            for key, value in c2_params.items():
+                if not isinstance(value, dict):
+                    placeholder = f"%{key}%"
+                    if placeholder in config_data:
+                        config_data = config_data.replace(
+                            placeholder, 
+                            json.dumps(value) if not isinstance(value, str) else value
+                        )
+
+            with open(config_path, "w") as cfg:
+                cfg.write(config_data)
+
+            logging.info(f"Config file updated for profile: {profile_name}")
+
+            # -------------------------
+            # Compile
+            # -------------------------
+            cmd = self._build_nim_command(build_root, aespsk_val, params, profile_name)
+            logging.info(f"Running Nim command: {' '.join(cmd)}")
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=build_root
+            )
+
             stdout, stderr = await proc.communicate()
-            if stdout:
-                resp.build_message += f'[stdout]\n{stdout.decode()}\n'
-            if stderr:
-                resp.build_message += f'[stderr]\n{stderr.decode()}\n'
-            resp.build_message += f'appending output: {output}\n'
-            resp.build_message += 'Attempting to zip output\n'
+            resp.build_message = (
+                "[NIM STDOUT]\n" + stdout.decode() +
+                "\n[NIM STDERR]\n" + stderr.decode()
+            )
 
-            if self.get_parameter('format') != "bin":
-                zipfile.ZipFile(f'{agent_build_path.name}/{self.name}.zip', 'w').write(f'{agent_build_path.name}/{self.name}{out_ext}')
-            else:
-                resp.build_message += f'Its shellcode so we sRDI it: {agent_build_path.name}/{self.name}\n'
-                shellcode_path = "{}/loader.bin".format(agent_build_path.name)
-                resp.build_message += f'This is our shellcode path: {shellcode_path}\n'
-                #converterPath = "/Mythic/agent_code/ConvertToShellcode.py"
-                #command = "chmod 777 {}; chmod +x {}".format(converterPath, converterPath)
-                #proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                #stdout, stderr = await proc.communicate()
-                #if stdout:
-                #    output += f'[stdout]\n{stdout.decode()}\n'
-                #if stderr:
-                #    output += f'[stderr]\n{stderr.decode()}\n'
+            if proc.returncode != 0:
+                resp.build_message = f"Nim build failed ({proc.returncode}).\n" + resp.build_message
+                return resp
 
-                #command = f'python3 {converterPath} -f Run -c -i -d 7 {agent_build_path.name}/{self.name}'
-                #proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=agent_build_path.name)
-                #stdout, stderr = await proc.communicate()
-                #if stdout:
-                #    output += f'[stdout]\n{stdout.decode()}\n'
-                #if stderr:
-                #    output += f'[stderr]\n{stderr.decode()}\n'
-                #resp.build_message += f'appending output: {output}\n'
+            # -------------------------
+            # Packaging
+            # -------------------------
+            ext = ".dll" if params["format"] in ("dll", "bin") else ".exe"
+            artifact_path = os.path.join(build_root, f"{self.name}{ext}")
+            zip_path = os.path.join(build_root, f"{self.name}.zip")
 
-                dll = open(f'{agent_build_path.name}/{self.name}{out_ext}', 'rb').read()
-                shellcode = ShellcodeRDI.ConvertToShellcode(dll, ShellcodeRDI.HashFunctionName('Run'), flags=0x5)
-                with open(shellcode_path, 'wb') as f:
-                    f.write(shellcode)
-                if (not os.path.exists(shellcode_path)):
-                    resp.build_message += "Failed to create shellcode"
-                    resp.status = BuildStatus.Error
-                    resp.payload = b""
+            if not os.path.exists(artifact_path):
+                resp.build_message = "Expected build output missing."
+                return resp
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                if params["format"] == "bin":
+                    if ShellcodeRDI is None:
+                        resp.build_message = "ShellcodeRDI module not available for bin format."
+                        return resp
+
+                    with open(artifact_path, "rb") as f:
+                        dll_bytes = f.read()
+
+                    shellcode = ShellcodeRDI.ConvertToShellcode(
+                        dll_bytes,
+                        ShellcodeRDI.HashFunctionName("Run"),
+                        flags=0x5
+                    )
+                    zf.writestr("loader.bin", shellcode)
                 else:
-                    zipfile.ZipFile(f'{agent_build_path.name}/{self.name}.zip', 'w').write(f'{shellcode_path}')
+                    zf.write(artifact_path, os.path.basename(artifact_path))
 
-            resp.payload = open(f'{agent_build_path.name}/{self.name}.zip', 'rb').read()
-            resp.build_message += 'Successfully built and zipped\n'
+            # -------------------------
+            # Finalize
+            # -------------------------
+            with open(zip_path, "rb") as z:
+                resp.payload = z.read()
+
             resp.status = BuildStatus.Success
+            resp.build_message = f"Payload built successfully with {profile_name} profile."
+            return resp
+
         except Exception as e:
-            import traceback, sys
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            resp.build_message += f"Error building payload: {e} traceback: " + repr(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        return resp
+            resp.build_message = (
+                f"Unexpected build error: {e}\n" + traceback.format_exc()
+            )
+            return resp
+
+        finally:
+            if temp_dir:
+                temp_dir.cleanup()
